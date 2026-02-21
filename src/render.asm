@@ -194,34 +194,25 @@ DrawMaze:
     jmp !placeTile+
 
 !placeTile:
-    // Write character to screen
+    // A = character code, X = color
+    // Save character and color before computing column offset
+    sta ZP_TEMP1             // Save character
+    stx ZP_TEMP2             // Save color
+
+    // Calculate screen column with maze offset
     ldy MazeDrawCol
     tya
     clc
-    adc #MAZE_OFFSET_X      // Add horizontal offset
+    adc #MAZE_OFFSET_X
     tay
 
-    // Store character
-    lda ZP_TEMP1             // Character already in A... let's fix this
-    pha                      // Save color
-    txa
-    pha
-
-    // We need to re-read the tile char (it was in A before the col calc)
-    // Actually let's restructure: save char/color before Y calc
-    // ... For now, simplified approach:
-
-!placeTileDirect:
-    // A = character code, X = color
-    // Y = screen column (with offset)
+    // Write character to screen
+    lda ZP_TEMP1
     sta (ZP_SCREEN_LO),y
 
-    // Write color
-    txa
+    // Write color to Color RAM
+    lda ZP_TEMP2
     sta (ZP_COLOR_LO),y
-
-    pla                     // Clean stack
-    pla
 
     inc MazeDrawCol
     jmp !colLoop-
@@ -435,12 +426,12 @@ DrawHUD:
     ldx #0
 !tenLoop:
     cmp #10
-    bcc !tens Done+
+    bcc !tensDone+
     sec
     sbc #10
     inx
     jmp !tenLoop-
-!tens Done:
+!tensDone:
     // X = tens digit, A = ones digit
     pha
     txa
