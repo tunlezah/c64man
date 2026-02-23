@@ -1,0 +1,1187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>CHOMPER - A Cosmic Maze Adventure</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  font-family: monospace;
+  overflow: hidden;
+  touch-action: none;
+}
+canvas {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+#game-canvas {
+  border: 2px solid #333;
+  max-width: 100vw;
+  max-height: 100vh;
+}
+#touch-controls {
+  display: none;
+  position: fixed;
+  bottom: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+}
+@media (pointer: coarse) {
+  #touch-controls { display: flex; gap: 5px; flex-direction: column; align-items: center; }
+}
+.touch-row { display: flex; gap: 5px; }
+.touch-btn {
+  width: 60px; height: 60px;
+  background: rgba(255,255,255,0.15);
+  border: 2px solid rgba(255,255,255,0.3);
+  border-radius: 10px;
+  color: #fff;
+  font-size: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.touch-btn:active { background: rgba(255,255,255,0.35); }
+</style>
+</head>
+<body>
+<canvas id="game-canvas"></canvas>
+<div id="touch-controls">
+  <div class="touch-row">
+    <div class="touch-btn" data-dir="up">&#9650;</div>
+  </div>
+  <div class="touch-row">
+    <div class="touch-btn" data-dir="left">&#9664;</div>
+    <div class="touch-btn" data-dir="down">&#9660;</div>
+    <div class="touch-btn" data-dir="right">&#9654;</div>
+  </div>
+</div>
+<script src="levels_data.js"></script>
+<script>
+// ============================================================================
+// CHOMPER - Web Edition
+// Faithful port of the C64 CHOMPER Pac-Man clone
+// ============================================================================
+
+const canvas = document.getElementById('game-canvas');
+const ctx = canvas.getContext('2d');
+
+// ---- Constants ----
+const TILE = 16;
+const MAZE_W = 28;
+const MAZE_H = 25;
+const HUD_H = 2; // extra rows at top for HUD
+const CANVAS_W = MAZE_W * TILE;
+const CANVAS_H = (MAZE_H + HUD_H) * TILE;
+canvas.width = CANVAS_W;
+canvas.height = CANVAS_H;
+
+// Scale canvas to fit screen
+function resizeCanvas() {
+  const ratio = CANVAS_W / CANVAS_H;
+  let w = window.innerWidth;
+  let h = window.innerHeight;
+  if (w / h > ratio) w = h * ratio;
+  else h = w / ratio;
+  canvas.style.width = Math.floor(w) + 'px';
+  canvas.style.height = Math.floor(h) + 'px';
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// Tile types
+const T_EMPTY = 0, T_WALL = 1, T_DOT = 2, T_POWER = 3, T_GATE = 4, T_TUNNEL = 5, T_BONUS = 6;
+
+// Directions: 0=right, 1=left, 2=up, 3=down, 4=none
+const DIR_RIGHT = 0, DIR_LEFT = 1, DIR_UP = 2, DIR_DOWN = 3, DIR_NONE = 4;
+const DX = [1, -1, 0, 0, 0];
+const DY = [0, 0, -1, 1, 0];
+const OPP = [1, 0, 3, 2, 4];
+
+// C64 color palette
+const C64 = {
+  black: '#000000', white: '#ffffff', red: '#68372b', cyan: '#70a4b2',
+  purple: '#6f3d86', green: '#588d43', blue: '#352879', yellow: '#b8c76f',
+  orange: '#6f4f25', brown: '#433900', lightRed: '#9a6759', darkGrey: '#444444',
+  grey: '#6c6c6c', lightGreen: '#9ad284', lightBlue: '#6c5eb5', lightGrey: '#959595',
+  // Brighter versions for web visibility
+  bRed: '#ff4444', bCyan: '#66ccff', bPurple: '#cc66ff', bOrange: '#ffaa33',
+  bYellow: '#ffff44', bBlue: '#4444ff', bPink: '#ff88aa', bGreen: '#44ff44',
+  bWhite: '#ffffff', wallBlue: '#2244cc', wallLightBlue: '#4466ff',
+  dotColor: '#ffddaa', powerColor: '#ffffff',
+};
+
+// Game states
+const STATE_TITLE = 0, STATE_PLAYING = 1, STATE_DYING = 2,
+      STATE_LEVEL_UP = 3, STATE_GAME_OVER = 4, STATE_GET_READY = 5;
+
+// ---- Audio Engine (Web Audio API) ----
+let audioCtx = null;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+}
+
+function playTone(freq, duration, type, vol) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.value = vol || 0.08;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + duration);
+}
+
+const SFX = {
+  dot(alt) { playTone(alt ? 587 : 440, 0.05, 'square', 0.06); },
+  power() { playTone(220, 0.3, 'sawtooth', 0.1); },
+  eatGhost() { playTone(300, 0.08, 'triangle', 0.1); setTimeout(() => playTone(600, 0.15, 'triangle', 0.1), 80); },
+  death() {
+    for (let i = 0; i < 8; i++) setTimeout(() => playTone(400 - i * 40, 0.15, 'triangle', 0.08), i * 120);
+  },
+  levelUp() {
+    [523, 659, 784, 1047].forEach((f, i) => setTimeout(() => playTone(f, 0.2, 'square', 0.08), i * 150));
+  },
+  extraLife() {
+    [523, 659, 784, 1047, 1319].forEach((f, i) => setTimeout(() => playTone(f, 0.15, 'square', 0.1), i * 100));
+  },
+  start() {
+    [262, 330, 392, 523, 392, 330, 262].forEach((f, i) => setTimeout(() => playTone(f, 0.15, 'square', 0.06), i * 120));
+  },
+};
+
+// ---- Game State ----
+let game = {
+  state: STATE_TITLE,
+  level: 0,
+  lives: 3,
+  score: 0,
+  hiScore: 10000,
+  maze: [],
+  dotsLeft: 0,
+  dotsTotal: 0,
+  frame: 0,
+  freezeTimer: 0,
+  ghostMode: 0, // 0=scatter, 1=chase
+  modeTimer: 0,
+  scatterPhase: 0,
+  powerTimer: 0,
+  ghostEatCount: 0,
+  bonusActive: false,
+  bonusType: 0,
+  bonusTimer: 0,
+  bonusSpawned: [false, false],
+  extraLifeAwarded: false,
+  dotAlt: false,
+};
+
+// Player state
+let player = {
+  x: 14, y: 17, dir: DIR_LEFT, nextDir: DIR_LEFT,
+  subX: 0, subY: 0, anim: 0, speed: 2,
+};
+
+// Ghost data
+const GHOST_COLORS = [C64.bRed, C64.bCyan, C64.bPurple, C64.bOrange];
+const GHOST_NAMES = ['SHADE', 'GLIMMER', 'PHANTOM', 'EMBER'];
+const SCATTER_X = [25, 2, 25, 2];
+const SCATTER_Y = [0, 0, 24, 24];
+const GHOST_START_X = [14, 12, 14, 16];
+const GHOST_START_Y = [11, 14, 14, 14];
+const GHOST_EXIT_X = 14, GHOST_EXIT_Y = 11;
+
+let ghosts = [];
+
+function makeGhost(i) {
+  return {
+    x: GHOST_START_X[i], y: GHOST_START_Y[i],
+    dir: DIR_LEFT, state: i === 0 ? 0 : 3, // 0=normal, 1=frightened, 2=eaten, 3=inHouse, 4=leaving
+    subX: 0, subY: 0, anim: 0,
+  };
+}
+
+// Scatter/chase durations (frames at 60fps)
+const SCATTER_CHASE = [
+  [420, 1200], [420, 1200], [300, 1200], [300, 99999]
+];
+
+// ---- Input ----
+let keys = {};
+let inputDir = DIR_NONE;
+
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  ensureAudio();
+  if (e.code === 'ArrowUp' || e.code === 'KeyW') inputDir = DIR_UP;
+  else if (e.code === 'ArrowDown' || e.code === 'KeyS') inputDir = DIR_DOWN;
+  else if (e.code === 'ArrowLeft' || e.code === 'KeyA') inputDir = DIR_LEFT;
+  else if (e.code === 'ArrowRight' || e.code === 'KeyD') inputDir = DIR_RIGHT;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space'].includes(e.code)) e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// Touch controls
+document.querySelectorAll('.touch-btn').forEach(btn => {
+  const handler = e => {
+    e.preventDefault();
+    ensureAudio();
+    const d = btn.dataset.dir;
+    if (d === 'up') inputDir = DIR_UP;
+    else if (d === 'down') inputDir = DIR_DOWN;
+    else if (d === 'left') inputDir = DIR_LEFT;
+    else if (d === 'right') inputDir = DIR_RIGHT;
+  };
+  btn.addEventListener('touchstart', handler, { passive: false });
+  btn.addEventListener('mousedown', handler);
+});
+
+// Swipe support
+let touchStartX = 0, touchStartY = 0;
+canvas.addEventListener('touchstart', e => {
+  ensureAudio();
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+  e.preventDefault();
+}, { passive: false });
+canvas.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+canvas.addEventListener('touchend', e => {
+  if (!e.changedTouches.length) return;
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  const dy = e.changedTouches[0].clientY - touchStartY;
+  if (Math.abs(dx) < 10 && Math.abs(dy) < 10) {
+    // Tap = start game on title
+    if (game.state === STATE_TITLE || game.state === STATE_GAME_OVER) startNewGame();
+    return;
+  }
+  if (Math.abs(dx) > Math.abs(dy)) {
+    inputDir = dx > 0 ? DIR_RIGHT : DIR_LEFT;
+  } else {
+    inputDir = dy > 0 ? DIR_DOWN : DIR_UP;
+  }
+  e.preventDefault();
+}, { passive: false });
+
+// ---- Level Loading ----
+function loadLevel() {
+  const data = LEVELS[game.level % LEVELS.length];
+  game.maze = [];
+  game.dotsLeft = 0;
+  game.dotsTotal = 0;
+
+  for (let y = 0; y < MAZE_H; y++) {
+    game.maze[y] = [];
+    for (let x = 0; x < MAZE_W; x++) {
+      const t = data[y * MAZE_W + x];
+      game.maze[y][x] = t;
+      if (t === T_DOT || t === T_POWER) {
+        game.dotsLeft++;
+        game.dotsTotal++;
+      }
+    }
+  }
+  game.bonusActive = false;
+  game.bonusSpawned = [false, false];
+}
+
+// ---- Tile helpers ----
+function getTile(x, y) {
+  if (y < 0 || y >= MAZE_H) return T_WALL;
+  const wx = ((x % MAZE_W) + MAZE_W) % MAZE_W;
+  return game.maze[y][wx];
+}
+
+function isPassable(x, y, isGhost) {
+  const t = getTile(x, y);
+  if (t === T_WALL) return false;
+  if (t === T_GATE) return !!isGhost;
+  return true;
+}
+
+function canMove(x, y, dir, isGhost) {
+  const nx = x + DX[dir];
+  const ny = y + DY[dir];
+  return isPassable(nx, ny, isGhost);
+}
+
+// ---- Wall auto-tiling ----
+function isWallLike(x, y) {
+  const t = getTile(x, y);
+  return t === T_WALL || t === T_GATE;
+}
+
+// ---- Player start position ----
+function findPlayerStart() {
+  // Search for a good start position: row 17 col 14 (like C64), fallback to finding open space near bottom
+  if (getTile(14, 17) !== T_WALL && getTile(14, 17) !== T_GATE) return { x: 14, y: 17 };
+  // Find bonus spot (tile 6) for reference, player starts below ghost house
+  for (let y = MAZE_H - 1; y >= MAZE_H / 2; y--) {
+    for (let x = 0; x < MAZE_W; x++) {
+      if (game.maze[y][x] === T_BONUS) return { x, y };
+    }
+  }
+  // Fallback: find first open space near center-bottom
+  for (let y = MAZE_H - 3; y >= 12; y--) {
+    const t = getTile(14, y);
+    if (t === T_DOT || t === T_EMPTY || t === T_POWER) return { x: 14, y };
+  }
+  return { x: 14, y: 23 };
+}
+
+function findBonusSpot() {
+  for (let y = 0; y < MAZE_H; y++) {
+    for (let x = 0; x < MAZE_W; x++) {
+      if (LEVELS[game.level % LEVELS.length][y * MAZE_W + x] === T_BONUS) return { x, y };
+    }
+  }
+  return { x: 14, y: 17 };
+}
+
+// ---- Init functions ----
+function initPlayer() {
+  const start = findPlayerStart();
+  player.x = start.x;
+  player.y = start.y;
+  player.dir = DIR_LEFT;
+  player.nextDir = DIR_LEFT;
+  player.subX = 0;
+  player.subY = 0;
+  player.anim = 0;
+}
+
+function initGhosts() {
+  ghosts = [];
+  for (let i = 0; i < 4; i++) ghosts.push(makeGhost(i));
+  game.ghostMode = 0;
+  game.scatterPhase = 0;
+  game.modeTimer = SCATTER_CHASE[0][0];
+  game.powerTimer = 0;
+  game.ghostEatCount = 0;
+}
+
+function startNewGame() {
+  ensureAudio();
+  game.score = 0;
+  game.lives = 3;
+  game.level = 0;
+  game.extraLifeAwarded = false;
+  loadLevel();
+  initPlayer();
+  initGhosts();
+  game.state = STATE_GET_READY;
+  game.freezeTimer = 150;
+  SFX.start();
+}
+
+function startLevel() {
+  loadLevel();
+  initPlayer();
+  initGhosts();
+  game.state = STATE_GET_READY;
+  game.freezeTimer = 150;
+}
+
+// ---- Ghost AI ----
+function getGhostSpeed(ghost, idx) {
+  if (ghost.state === 2) return 3; // eaten - fast
+  if (ghost.state === 1) return 1; // frightened - slow
+  const tier = Math.min(Math.floor(game.level / 5), 4);
+  return 1.5 + tier * 0.3;
+}
+
+function getPlayerSpeed() {
+  const tier = Math.min(Math.floor(game.level / 5), 4);
+  return 1.8 + tier * 0.2;
+}
+
+function ghostTarget(ghost, idx) {
+  if (ghost.state === 1) return null; // random for frightened
+
+  if (game.ghostMode === 0) {
+    // Scatter - target home corner
+    return { x: SCATTER_X[idx], y: SCATTER_Y[idx] };
+  }
+
+  // Chase mode
+  switch (idx) {
+    case 0: // SHADE - direct chaser
+      return { x: player.x, y: player.y };
+    case 1: { // GLIMMER - ambusher (4 tiles ahead)
+      let tx = player.x + DX[player.dir] * 4;
+      let ty = player.y + DY[player.dir] * 4;
+      // Replicate arcade bug: when facing up, also offset 4 left
+      if (player.dir === DIR_UP) tx -= 4;
+      return { x: tx, y: ty };
+    }
+    case 2: { // PHANTOM - flanker (vector doubling from Shade)
+      const ax = player.x + DX[player.dir] * 2;
+      const ay = player.y + DY[player.dir] * 2;
+      const sx = ghosts[0].x;
+      const sy = ghosts[0].y;
+      return { x: 2 * ax - sx, y: 2 * ay - sy };
+    }
+    case 3: { // EMBER - unpredictable
+      const dist = Math.abs(player.x - ghost.x) + Math.abs(player.y - ghost.y);
+      if (dist <= 8) return { x: SCATTER_X[3], y: SCATTER_Y[3] };
+      return { x: player.x, y: player.y };
+    }
+  }
+  return { x: player.x, y: player.y };
+}
+
+function pickGhostDirection(ghost, target) {
+  const reverse = OPP[ghost.dir];
+  let bestDist = Infinity;
+  let bestDir = ghost.dir;
+
+  // Priority order: up, left, down, right (matching arcade)
+  const dirs = [DIR_UP, DIR_LEFT, DIR_DOWN, DIR_RIGHT];
+  for (const d of dirs) {
+    if (d === reverse) continue;
+    const nx = ghost.x + DX[d];
+    const ny = ghost.y + DY[d];
+    if (!isPassable(nx, ny, true)) continue;
+
+    if (!target) {
+      // Frightened - pick random
+      if (Math.random() < 0.25) return d;
+      continue;
+    }
+
+    const dist = Math.abs(nx - target.x) + Math.abs(ny - target.y);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestDir = d;
+    }
+  }
+
+  // For frightened, if we didn't pick randomly, pick any valid dir
+  if (!target) {
+    for (const d of dirs) {
+      if (d === reverse) continue;
+      if (isPassable(ghost.x + DX[d], ghost.y + DY[d], true)) return d;
+    }
+  }
+
+  return bestDir;
+}
+
+function updateGhost(ghost, idx) {
+  if (ghost.state === 3) {
+    // In house - bob up and down
+    ghost.anim = (ghost.anim + 1) % 32;
+
+    // Check release conditions
+    const dotsEaten = game.dotsTotal - game.dotsLeft;
+    const releaseAt = [0, 10, 30, 50][idx];
+    if (dotsEaten >= releaseAt) {
+      ghost.state = 4; // leaving
+    }
+    return;
+  }
+
+  if (ghost.state === 4) {
+    // Leaving house
+    if (ghost.x !== GHOST_EXIT_X) {
+      ghost.x += ghost.x < GHOST_EXIT_X ? 1 : -1;
+      return;
+    }
+    if (ghost.y > GHOST_EXIT_Y) {
+      ghost.y--;
+      return;
+    }
+    ghost.state = 0;
+    ghost.dir = DIR_LEFT;
+    return;
+  }
+
+  if (ghost.state === 2) {
+    // Eaten - navigate to house
+    if (ghost.x === GHOST_EXIT_X && ghost.y === GHOST_EXIT_Y) {
+      ghost.state = 3;
+      ghost.y = 14;
+      return;
+    }
+    const target = { x: GHOST_EXIT_X, y: GHOST_EXIT_Y };
+    ghost.dir = pickGhostDirection(ghost, target);
+  }
+
+  // Move ghost
+  const speed = getGhostSpeed(ghost, idx);
+  ghost.subX += speed;
+
+  while (ghost.subX >= 4) {
+    ghost.subX -= 4;
+
+    // At tile center - make AI decision
+    const target = ghost.state === 2
+      ? { x: GHOST_EXIT_X, y: GHOST_EXIT_Y }
+      : ghostTarget(ghost, idx);
+    ghost.dir = pickGhostDirection(ghost, target);
+
+    const nx = ghost.x + DX[ghost.dir];
+    const ny = ghost.y + DY[ghost.dir];
+
+    if (isPassable(nx, ny, true)) {
+      ghost.x = ((nx % MAZE_W) + MAZE_W) % MAZE_W;
+      ghost.y = ny;
+    }
+  }
+
+  ghost.anim++;
+}
+
+// ---- Update functions ----
+function updatePlayer() {
+  // Direction input buffering
+  if (inputDir !== DIR_NONE) {
+    player.nextDir = inputDir;
+  }
+
+  // Try desired direction first
+  if (canMove(player.x, player.y, player.nextDir, false)) {
+    player.dir = player.nextDir;
+  }
+
+  // Check current direction
+  if (!canMove(player.x, player.y, player.dir, false)) {
+    player.anim++;
+    return;
+  }
+
+  const speed = getPlayerSpeed();
+  player.subX += speed;
+
+  while (player.subX >= 4) {
+    player.subX -= 4;
+
+    // Try turning at each sub-step
+    if (canMove(player.x, player.y, player.nextDir, false)) {
+      player.dir = player.nextDir;
+    }
+
+    const nx = player.x + DX[player.dir];
+    const ny = player.y + DY[player.dir];
+
+    if (isPassable(nx, ny, false)) {
+      player.x = ((nx % MAZE_W) + MAZE_W) % MAZE_W;
+      player.y = ny;
+      onEnterTile();
+    } else {
+      player.subX = 0;
+      break;
+    }
+  }
+
+  player.anim++;
+}
+
+function onEnterTile() {
+  const t = game.maze[player.y][player.x];
+  if (t === T_DOT) {
+    game.maze[player.y][player.x] = T_EMPTY;
+    game.score += 10;
+    game.dotsLeft--;
+    game.dotAlt = !game.dotAlt;
+    SFX.dot(game.dotAlt);
+    checkLevelClear();
+    checkBonus();
+  } else if (t === T_POWER) {
+    game.maze[player.y][player.x] = T_EMPTY;
+    game.score += 50;
+    game.dotsLeft--;
+    activateFrightened();
+    SFX.power();
+    checkLevelClear();
+  }
+  checkExtraLife();
+  checkHighScore();
+}
+
+function checkLevelClear() {
+  if (game.dotsLeft <= 0) {
+    game.state = STATE_LEVEL_UP;
+    game.freezeTimer = 120;
+    SFX.levelUp();
+  }
+}
+
+function activateFrightened() {
+  game.ghostEatCount = 0;
+  // Frightened duration decreases with level
+  const durations = [360, 300, 240, 180, 120, 60, 30];
+  const tier = Math.min(game.level, durations.length - 1);
+  game.powerTimer = durations[tier];
+
+  for (const g of ghosts) {
+    if (g.state === 2 || g.state === 3) continue;
+    if (g.state === 0 || g.state === 1) {
+      g.state = 1;
+      g.dir = OPP[g.dir]; // reverse on mode change
+    }
+  }
+}
+
+function checkCollisions() {
+  for (let i = 0; i < 4; i++) {
+    const g = ghosts[i];
+    if (g.state === 3 || g.state === 4 || g.state === 2) continue;
+    if (g.x === player.x && g.y === player.y) {
+      if (g.state === 1) {
+        // Eat ghost
+        g.state = 2;
+        const pts = [200, 400, 800, 1600][Math.min(game.ghostEatCount, 3)];
+        game.score += pts;
+        game.ghostEatCount++;
+        SFX.eatGhost();
+        checkHighScore();
+        checkExtraLife();
+      } else {
+        // Player dies
+        playerDies();
+        return;
+      }
+    }
+  }
+}
+
+function playerDies() {
+  game.state = STATE_DYING;
+  game.freezeTimer = 120;
+  SFX.death();
+}
+
+function checkHighScore() {
+  if (game.score > game.hiScore) game.hiScore = game.score;
+}
+
+function checkExtraLife() {
+  if (!game.extraLifeAwarded && game.score >= 10000) {
+    game.extraLifeAwarded = true;
+    game.lives++;
+    SFX.extraLife();
+  }
+}
+
+function checkBonus() {
+  const eaten = game.dotsTotal - game.dotsLeft;
+  if (eaten === 70 && !game.bonusSpawned[0]) {
+    game.bonusSpawned[0] = true;
+    game.bonusActive = true;
+    game.bonusType = game.level % 8;
+    game.bonusTimer = 600;
+  }
+  if (eaten === 170 && !game.bonusSpawned[1]) {
+    game.bonusSpawned[1] = true;
+    game.bonusActive = true;
+    game.bonusType = game.level % 8;
+    game.bonusTimer = 600;
+  }
+}
+
+function updateModeTimer() {
+  if (game.powerTimer > 0) {
+    game.powerTimer--;
+    if (game.powerTimer <= 0) {
+      // End frightened
+      for (const g of ghosts) {
+        if (g.state === 1) g.state = 0;
+      }
+    }
+    return;
+  }
+
+  game.modeTimer--;
+  if (game.modeTimer <= 0) {
+    // Toggle scatter/chase
+    game.ghostMode = game.ghostMode === 0 ? 1 : 0;
+    // Reverse all normal ghosts
+    for (const g of ghosts) {
+      if (g.state === 0) g.dir = OPP[g.dir];
+    }
+    game.scatterPhase = Math.min(game.scatterPhase + 1, 7);
+    const phaseIdx = Math.min(Math.floor(game.scatterPhase / 2), 3);
+    game.modeTimer = SCATTER_CHASE[phaseIdx][game.ghostMode];
+  }
+}
+
+function updateBonus() {
+  if (!game.bonusActive) return;
+  game.bonusTimer--;
+  if (game.bonusTimer <= 0) { game.bonusActive = false; return; }
+  const spot = findBonusSpot();
+  if (player.x === spot.x && player.y === spot.y) {
+    const scores = [100, 300, 500, 700, 1000, 2000, 3000, 5000];
+    game.score += scores[game.bonusType];
+    game.bonusActive = false;
+    checkHighScore();
+    playTone(880, 0.15, 'triangle', 0.1);
+  }
+}
+
+// ---- Main update ----
+function update() {
+  game.frame++;
+
+  switch (game.state) {
+    case STATE_TITLE:
+      if (keys['Space'] || keys['Enter'] || keys['KeyZ']) startNewGame();
+      break;
+
+    case STATE_GET_READY:
+      game.freezeTimer--;
+      if (game.freezeTimer <= 0) game.state = STATE_PLAYING;
+      break;
+
+    case STATE_PLAYING:
+      updatePlayer();
+      for (let i = 0; i < 4; i++) updateGhost(ghosts[i], i);
+      checkCollisions();
+      updateModeTimer();
+      updateBonus();
+      break;
+
+    case STATE_DYING:
+      game.freezeTimer--;
+      if (game.freezeTimer <= 0) {
+        game.lives--;
+        if (game.lives < 0) {
+          game.lives = 0;
+          game.state = STATE_GAME_OVER;
+          game.freezeTimer = 300;
+        } else {
+          initPlayer();
+          initGhosts();
+          game.state = STATE_GET_READY;
+          game.freezeTimer = 150;
+        }
+      }
+      break;
+
+    case STATE_LEVEL_UP:
+      game.freezeTimer--;
+      if (game.freezeTimer <= 0) {
+        game.level++;
+        if (game.level >= LEVELS.length) game.level = LEVELS.length - 1;
+        startLevel();
+      }
+      break;
+
+    case STATE_GAME_OVER:
+      game.freezeTimer--;
+      if (game.freezeTimer <= 0 || keys['Space'] || keys['Enter']) {
+        game.state = STATE_TITLE;
+      }
+      break;
+  }
+}
+
+// ---- Rendering ----
+function drawWall(x, y) {
+  const px = x * TILE;
+  const py = (y + HUD_H) * TILE;
+
+  // Determine wall connectivity for auto-tiling
+  const n = isWallLike(x, y - 1);
+  const s = isWallLike(x, y + 1);
+  const e = isWallLike(x + 1, y);
+  const w = isWallLike(x - 1, y);
+
+  // Outer border detection (first/last row/col)
+  const isOuter = x === 0 || x === MAZE_W - 1 || y === 0 || y === MAZE_H - 1;
+
+  ctx.strokeStyle = isOuter ? C64.wallLightBlue : C64.wallBlue;
+  ctx.lineWidth = isOuter ? 3 : 2;
+
+  const m = TILE / 2;
+  const inset = 2;
+
+  ctx.beginPath();
+
+  // Draw connecting segments based on neighbors
+  if (!n && !s && !e && !w) {
+    // Isolated wall
+    ctx.rect(px + inset, py + inset, TILE - inset * 2, TILE - inset * 2);
+  } else {
+    if (n) { ctx.moveTo(px + m, py); ctx.lineTo(px + m, py + m); }
+    if (s) { ctx.moveTo(px + m, py + m); ctx.lineTo(px + m, py + TILE); }
+    if (e) { ctx.moveTo(px + m, py + m); ctx.lineTo(px + TILE, py + m); }
+    if (w) { ctx.moveTo(px, py + m); ctx.lineTo(px + m, py + m); }
+
+    // Corners for connected walls
+    if (!n && !w && e && s) { ctx.moveTo(px + m, py + m); ctx.arc(px + m, py + m, 0.5, 0, 0); }
+    if (!n && !e && w && s) { ctx.moveTo(px + m, py + m); ctx.arc(px + m, py + m, 0.5, 0, 0); }
+  }
+  ctx.stroke();
+
+  // Add rounded corners for L-shaped walls
+  ctx.beginPath();
+  ctx.lineWidth = isOuter ? 3 : 2;
+  const r = 5;
+  if (n && e && !isWallLike(x + 1, y - 1)) {
+    ctx.arc(px + TILE, py, r, Math.PI * 0.5, Math.PI, false);
+  }
+  if (n && w && !isWallLike(x - 1, y - 1)) {
+    ctx.arc(px, py, r, 0, Math.PI * 0.5, false);
+  }
+  if (s && e && !isWallLike(x + 1, y + 1)) {
+    ctx.arc(px + TILE, py + TILE, r, Math.PI, Math.PI * 1.5, false);
+  }
+  if (s && w && !isWallLike(x - 1, y + 1)) {
+    ctx.arc(px, py + TILE, r, Math.PI * 1.5, 0, false);
+  }
+  ctx.stroke();
+}
+
+function drawMaze() {
+  for (let y = 0; y < MAZE_H; y++) {
+    for (let x = 0; x < MAZE_W; x++) {
+      const t = game.maze[y][x];
+      const px = x * TILE;
+      const py = (y + HUD_H) * TILE;
+
+      if (t === T_WALL) {
+        drawWall(x, y);
+      } else if (t === T_DOT) {
+        ctx.fillStyle = C64.dotColor;
+        ctx.beginPath();
+        ctx.arc(px + TILE / 2, py + TILE / 2, 2, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (t === T_POWER) {
+        const blink = Math.floor(game.frame / 10) % 2;
+        if (blink) {
+          ctx.fillStyle = C64.powerColor;
+          ctx.beginPath();
+          ctx.arc(px + TILE / 2, py + TILE / 2, 5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (t === T_GATE) {
+        ctx.fillStyle = C64.bPink;
+        ctx.fillRect(px, py + TILE / 2 - 2, TILE, 4);
+      }
+    }
+  }
+
+  // Bonus item
+  if (game.bonusActive) {
+    const spot = findBonusSpot();
+    const px = spot.x * TILE;
+    const py = (spot.y + HUD_H) * TILE;
+    const symbols = ['🍒', '⭐', '💎', '👑', '🍊', '🍎', '🔔', '🔑'];
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(symbols[game.bonusType] || '?', px + TILE / 2, py + TILE - 2);
+  }
+}
+
+function drawPlayer() {
+  if (game.state === STATE_DYING) {
+    // Death animation - shrinking chomper
+    const progress = 1 - (game.freezeTimer / 120);
+    const angle = progress * Math.PI;
+    const px = player.x * TILE + TILE / 2;
+    const py = (player.y + HUD_H) * TILE + TILE / 2;
+    const r = TILE / 2 - 1;
+
+    ctx.fillStyle = C64.bYellow;
+    ctx.beginPath();
+    ctx.arc(px, py, r * (1 - progress * 0.5), angle, Math.PI * 2 - angle);
+    ctx.lineTo(px, py);
+    ctx.closePath();
+    ctx.fill();
+    return;
+  }
+
+  const px = player.x * TILE + TILE / 2;
+  const py = (player.y + HUD_H) * TILE + TILE / 2;
+  const r = TILE / 2 - 1;
+
+  // Mouth animation
+  const mouthAngle = (Math.sin(player.anim * 0.5) * 0.3 + 0.3) * Math.PI;
+
+  // Direction angles
+  const dirAngles = [0, Math.PI, -Math.PI / 2, Math.PI / 2];
+  const baseAngle = dirAngles[player.dir] || 0;
+
+  ctx.fillStyle = C64.bYellow;
+  ctx.beginPath();
+  ctx.arc(px, py, r, baseAngle + mouthAngle, baseAngle - mouthAngle + Math.PI * 2);
+  ctx.lineTo(px, py);
+  ctx.closePath();
+  ctx.fill();
+
+  // Eye
+  const eyeDist = 3;
+  const eyeAngle = baseAngle - Math.PI / 4;
+  const ex = px + Math.cos(eyeAngle) * eyeDist;
+  const ey = py + Math.sin(eyeAngle) * eyeDist;
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.arc(ex, ey, 1.5, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawGhosts() {
+  for (let i = 0; i < 4; i++) {
+    const g = ghosts[i];
+    const px = g.x * TILE + TILE / 2;
+    const py = (g.y + HUD_H) * TILE + TILE / 2;
+    const r = TILE / 2 - 1;
+
+    if (g.state === 2) {
+      // Eaten - draw eyes only
+      drawGhostEyes(px, py, g.dir);
+      continue;
+    }
+
+    // Body color
+    if (g.state === 1) {
+      // Frightened - blue, flash white when timer is low
+      if (game.powerTimer < 120 && Math.floor(game.frame / 8) % 2) {
+        ctx.fillStyle = C64.bWhite;
+      } else {
+        ctx.fillStyle = C64.bBlue;
+      }
+    } else {
+      ctx.fillStyle = GHOST_COLORS[i];
+    }
+
+    // Ghost body
+    ctx.beginPath();
+    ctx.arc(px, py - 2, r, Math.PI, 0);
+    ctx.lineTo(px + r, py + r - 2);
+
+    // Wavy bottom
+    const wave = Math.floor(g.anim / 8) % 2;
+    const segments = 3;
+    const sw = (r * 2) / segments;
+    for (let s = 0; s < segments; s++) {
+      const bx = px + r - s * sw;
+      const by = py + r - 2;
+      const cy = wave === (s % 2) ? by + 3 : by - 1;
+      ctx.lineTo(bx - sw / 2, cy);
+      ctx.lineTo(bx - sw, by);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Eyes
+    if (g.state !== 1) {
+      drawGhostEyes(px, py, g.dir);
+    } else {
+      // Frightened face
+      ctx.fillStyle = C64.bWhite;
+      ctx.beginPath();
+      ctx.arc(px - 3, py - 3, 2, 0, Math.PI * 2);
+      ctx.arc(px + 3, py - 3, 2, 0, Math.PI * 2);
+      ctx.fill();
+      // Wavy mouth
+      ctx.strokeStyle = C64.bWhite;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(px - 4, py + 2);
+      for (let m = 0; m < 4; m++) {
+        ctx.lineTo(px - 4 + m * 2.5 + 1.25, py + (m % 2 ? 4 : 1));
+      }
+      ctx.stroke();
+    }
+  }
+}
+
+function drawGhostEyes(px, py, dir) {
+  const eyeOffX = [-1, 1];
+  const lookDX = [2, -2, 0, 0][dir] || 0;
+  const lookDY = [0, 0, -2, 2][dir] || 0;
+
+  for (const ox of eyeOffX) {
+    // White of eye
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.ellipse(px + ox * 4, py - 3, 3, 4, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // Pupil
+    ctx.fillStyle = '#33f';
+    ctx.beginPath();
+    ctx.arc(px + ox * 4 + lookDX, py - 3 + lookDY, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawHUD() {
+  const y = 0;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, CANVAS_W, HUD_H * TILE);
+
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'left';
+
+  // Score
+  ctx.fillStyle = C64.bWhite;
+  ctx.fillText('SCORE', 4, 12);
+  ctx.fillStyle = C64.bYellow;
+  ctx.fillText(String(game.score).padStart(6, '0'), 4, 26);
+
+  // High score
+  ctx.fillStyle = C64.bWhite;
+  ctx.textAlign = 'center';
+  ctx.fillText('HIGH SCORE', CANVAS_W / 2, 12);
+  ctx.fillStyle = C64.bCyan;
+  ctx.fillText(String(game.hiScore).padStart(6, '0'), CANVAS_W / 2, 26);
+
+  // Lives
+  ctx.textAlign = 'right';
+  ctx.fillStyle = C64.bWhite;
+  ctx.fillText('LV' + (game.level + 1), CANVAS_W - 4, 12);
+
+  // Life icons
+  for (let i = 0; i < Math.min(game.lives, 5); i++) {
+    const lx = CANVAS_W - 60 + i * 12;
+    ctx.fillStyle = C64.bYellow;
+    ctx.beginPath();
+    ctx.arc(lx, 24, 5, 0.3, Math.PI * 2 - 0.3);
+    ctx.lineTo(lx, 24);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+function drawTitle() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  // Animated title color
+  const hue = (game.frame * 2) % 360;
+
+  ctx.font = 'bold 36px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = `hsl(${hue}, 100%, 65%)`;
+  ctx.fillText('CHOMPER', CANVAS_W / 2, 80);
+
+  ctx.font = '12px monospace';
+  ctx.fillStyle = C64.lightGrey;
+  ctx.fillText('A COSMIC MAZE ADVENTURE', CANVAS_W / 2, 110);
+
+  // Ghost showcase
+  const ghostY = 170;
+  ctx.font = '11px monospace';
+  for (let i = 0; i < 4; i++) {
+    const gy = ghostY + i * 30;
+
+    // Draw mini ghost
+    ctx.fillStyle = GHOST_COLORS[i];
+    ctx.beginPath();
+    ctx.arc(CANVAS_W / 2 - 60, gy, 8, Math.PI, 0);
+    ctx.lineTo(CANVAS_W / 2 - 52, gy + 6);
+    ctx.lineTo(CANVAS_W / 2 - 55, gy + 3);
+    ctx.lineTo(CANVAS_W / 2 - 60, gy + 6);
+    ctx.lineTo(CANVAS_W / 2 - 65, gy + 3);
+    ctx.lineTo(CANVAS_W / 2 - 68, gy + 6);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = GHOST_COLORS[i];
+    ctx.textAlign = 'left';
+    ctx.fillText(GHOST_NAMES[i], CANVAS_W / 2 - 40, gy + 4);
+  }
+
+  // Blinking "press" text
+  if (Math.floor(game.frame / 30) % 2) {
+    ctx.font = '14px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = C64.bGreen;
+    ctx.fillText('PRESS SPACE OR TAP TO START', CANVAS_W / 2, 330);
+  }
+
+  // High score
+  ctx.font = '12px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = C64.bCyan;
+  ctx.fillText('HIGH SCORE: ' + String(game.hiScore).padStart(6, '0'), CANVAS_W / 2, 370);
+
+  // Year
+  ctx.fillStyle = C64.darkGrey;
+  ctx.fillText('2026', CANVAS_W / 2, CANVAS_H - 20);
+}
+
+function drawGetReady() {
+  if (game.freezeTimer > 20) {
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = C64.bYellow;
+    ctx.fillText('GET READY!', CANVAS_W / 2, (12 + HUD_H) * TILE + 8);
+  }
+}
+
+function drawGameOver() {
+  ctx.font = 'bold 24px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = C64.bRed;
+  ctx.fillText('GAME OVER', CANVAS_W / 2, (12 + HUD_H) * TILE + 8);
+
+  ctx.font = '12px monospace';
+  ctx.fillStyle = C64.bWhite;
+  ctx.fillText('FINAL SCORE: ' + game.score, CANVAS_W / 2, (14 + HUD_H) * TILE);
+}
+
+function draw() {
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+  if (game.state === STATE_TITLE) {
+    drawTitle();
+    return;
+  }
+
+  drawHUD();
+  drawMaze();
+
+  if (game.state === STATE_GET_READY) {
+    drawPlayer();
+    drawGhosts();
+    drawGetReady();
+  } else if (game.state === STATE_PLAYING) {
+    drawPlayer();
+    drawGhosts();
+  } else if (game.state === STATE_DYING) {
+    drawPlayer();
+  } else if (game.state === STATE_LEVEL_UP) {
+    drawPlayer();
+    // Flash walls
+    if (Math.floor(game.frame / 6) % 2) {
+      ctx.globalAlpha = 0.3;
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, HUD_H * TILE, CANVAS_W, MAZE_H * TILE);
+      ctx.globalAlpha = 1;
+    }
+  } else if (game.state === STATE_GAME_OVER) {
+    drawPlayer();
+    drawGameOver();
+  }
+}
+
+// ---- Game Loop ----
+function gameLoop() {
+  update();
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+// Start
+game.state = STATE_TITLE;
+gameLoop();
+</script>
+</body>
+</html>
